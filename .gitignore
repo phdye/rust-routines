@@ -1,0 +1,47 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backup files
+*.backup
+*.bak
+
+# Issue tracking (private development artifacts)
+/issue/
+
+# Benchmarks results
+*.bench
+
+# Coverage reports
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# Documentation build
+/doc/book/
+
+# Local configuration
+.env
+.env.local
+
+# Profiling
+perf.data*
+*.prof
+
+# Temporary files
+tmp/
+temp/

@@ -1,0 +1,45 @@
+[package]
+name = "rust-routines"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["Philip Dye <cargo.test.summary@gmail.com>"]
+description = "Goroutines in Rust - Go-like concurrency primitives for Rust"
+repository = "https://github.com/phdye/rust-routines"
+license = "MIT OR Apache-2.0"
+keywords = ["concurrency", "async", "goroutines", "channels", "threads"]
+categories = ["concurrency", "asynchronous"]
+readme = "README.md"
+
+[lib]
+name = "rust_routines"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+crossbeam = "0.8"
+parking_lot = "0.12"
+thiserror = "1.0"
+rand = "0.8"
+
+[dev-dependencies]
+criterion = "0.5"
+tokio-test = "0.4"
+rand = "0.8"
+
+[[bench]]
+name = "channel_benchmark"
+harness = false
+
+[[bench]]
+name = "routine_benchmark"
+harness = false
+
+[features]
+default = []
+no-std = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
