@@ -40,6 +40,7 @@ pub mod routine;
 pub mod select;
 pub mod runtime;
 pub mod error;
+pub mod scheduler;
 
 /// Convenient re-exports for common functionality
 pub mod prelude {
