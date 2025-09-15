@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::collections::HashMap;
 use parking_lot::RwLock;
-use rand::{thread_rng, Rng};
 use once_cell::sync::Lazy;
 use crate::error::{Error, Result};
 use super::worker::{Worker, WorkerId, WorkerConfig};
 use super::queue::{Task, GlobalQueue, Stealer};
+use super::steal::{WorkStealer, StealStrategy, SchedulingPolicy, LoadBalancer};
 
 /// Global scheduler instance
 pub static GLOBAL_SCHEDULER: Lazy<Arc<Scheduler>> = Lazy::new(|| {
@@ -32,6 +32,10 @@ pub struct SchedulerConfig {
     pub park_timeout_ms: u64,
     /// Enable NUMA awareness
     pub numa_aware: bool,
+    /// Work-stealing strategy
+    pub steal_strategy: StealStrategy,
+    /// Scheduling policy
+    pub scheduling_policy: SchedulingPolicy,
 }
 
 impl Default for SchedulerConfig {
@@ -45,6 +49,8 @@ impl Default for SchedulerConfig {
             steal_batch_size: 32,
             park_timeout_ms: 1,
             numa_aware: false,
+            steal_strategy: StealStrategy::Random,
+            scheduling_policy: SchedulingPolicy::LIFO,
         }
     }
 }
@@ -72,6 +78,10 @@ pub struct Scheduler {
     stealers: RwLock<HashMap<WorkerId, Stealer<Task>>>,
     /// Global task queue
     global_queue: GlobalQueue,
+    /// Work stealer for load balancing
+    work_stealer: RwLock<WorkStealer>,
+    /// Load balancer for steal decisions
+    load_balancer: LoadBalancer,
     /// Scheduler statistics
     stats: Arc<SchedulerStats>,
     /// Shutdown flag
@@ -121,6 +131,11 @@ impl Scheduler {
                 workers: RwLock::new(workers),
                 stealers: RwLock::new(stealers),
                 global_queue: GlobalQueue::new(),
+                work_stealer: RwLock::new(WorkStealer::new(
+                    config.steal_strategy,
+                    config.scheduling_policy,
+                )),
+                load_balancer: LoadBalancer::default(),
                 stats: Arc::new(SchedulerStats::default()),
                 shutdown: AtomicBool::new(false),
                 next_worker_id: AtomicUsize::new(num_workers),
@@ -193,39 +208,12 @@ impl Scheduler {
             }
         }
         
-        // Try to steal from other workers
+        // Use the work stealer to steal from other workers
         let workers = self.workers.read();
-        let num_workers = workers.len();
+        let workers_vec: Vec<Arc<Worker>> = workers.values().cloned().collect();
         
-        if num_workers <= 1 {
-            return None;
-        }
-        
-        // Random stealing for better load distribution
-        let mut rng = thread_rng();
-        let mut victim_indices: Vec<usize> = (0..num_workers)
-            .filter(|&i| WorkerId(i) != worker_id)
-            .collect();
-        
-        // Shuffle for random stealing order
-        for i in (1..victim_indices.len()).rev() {
-            let j = rng.gen_range(0..=i);
-            victim_indices.swap(i, j);
-        }
-        
-        // Try to steal from each victim
-        for victim_idx in victim_indices {
-            let victim_id = WorkerId(victim_idx);
-            
-            if let Some(victim) = workers.get(&victim_id) {
-                let stolen = victim.steal_tasks(self.config.steal_batch_size);
-                if !stolen.is_empty() {
-                    return Some(stolen);
-                }
-            }
-        }
-        
-        None
+        let work_stealer = self.work_stealer.read();
+        work_stealer.steal_work(worker_id, &workers_vec, self.config.steal_batch_size)
     }
     
     /// Shutdown the scheduler

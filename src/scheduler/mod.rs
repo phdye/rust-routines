@@ -6,10 +6,12 @@
 pub mod worker;
 pub mod queue;
 pub mod scheduler;
+pub mod steal;
 
 pub use scheduler::{Scheduler, SchedulerConfig};
 pub use worker::{Worker, WorkerId};
 pub use queue::{WorkQueue, Task};
+pub use steal::{WorkStealer, StealStrategy, SchedulingPolicy, LoadBalancer};
 
 #[cfg(test)]
 mod tests {
