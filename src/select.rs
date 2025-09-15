@@ -117,16 +117,43 @@ impl<T: Send + 'static> Select<T> {
                 }
             }
         } else {
-            // Without timeout
-            if let Some(op) = self.operations.into_iter().next() {
-                let future = match op {
-                    SelectOperation::Recv(f) => f,
-                    SelectOperation::Send(f) => f,
-                };
-                future.await
+            // Without timeout - if there's a default case, try operations with minimal timeout
+            if self.default_case.is_some() {
+                // With default case: try operations briefly, then fall back to default
+                if let Some(op) = self.operations.into_iter().next() {
+                    let future = match op {
+                        SelectOperation::Recv(f) => f,
+                        SelectOperation::Send(f) => f,
+                    };
+                    
+                    // Try the operation with a very short timeout
+                    match tokio::time::timeout(Duration::from_nanos(1), future).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            // Operation would block, execute default case
+                            if let Some(default) = self.default_case {
+                                Ok(default())
+                            } else {
+                                unreachable!() // We already checked default_case.is_some()
+                            }
+                        }
+                    }
+                } else {
+                    // No operations but have default
+                    if let Some(default) = self.default_case {
+                        Ok(default())
+                    } else {
+                        unreachable!() // We already checked default_case.is_some()
+                    }
+                }
             } else {
-                if let Some(default) = self.default_case {
-                    Ok(default())
+                // No default case - wait indefinitely
+                if let Some(op) = self.operations.into_iter().next() {
+                    let future = match op {
+                        SelectOperation::Recv(f) => f,
+                        SelectOperation::Send(f) => f,
+                    };
+                    future.await
                 } else {
                     Err(Error::RuntimeError { 
                         reason: "No operations available".to_string() 
@@ -331,9 +358,9 @@ mod tests {
     #[tokio::test]
     async fn test_select_fairness() {
         // Test that operations are selected fairly
-        let (tx1, rx1) = channel::<i32>();
-        let (tx2, rx2) = channel::<i32>();
-        let (tx3, rx3) = channel::<i32>();
+        let (tx1, _rx1) = channel::<i32>();
+        let (tx2, _rx2) = channel::<i32>();
+        let (tx3, _rx3) = channel::<i32>();
         
         // Send values on all channels
         tx1.send(1).await.unwrap();

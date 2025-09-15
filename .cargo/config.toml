@@ -1,0 +1,10 @@
+# Cargo configuration for rust-routines
+# Addresses Cygwin/Windows path and linker issues
+
+[target.x86_64-pc-windows-msvc]
+# Use the system linker instead of rust-lld
+linker = "link.exe"
+
+[build]
+# Set target directory to a Windows-friendly location
+target-dir = "target"
