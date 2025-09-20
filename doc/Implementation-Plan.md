@@ -29,12 +29,13 @@ Rust Routines brings Go's elegant concurrency model to Rust, providing lightweig
 ```
 rust-routines/
 ├── routine/          # Core routine implementation
-│   ├── stack.rs     # Stack management and allocation
-│   ├── context.rs   # Context switching (platform-specific)
+│   ├── handle.rs    # RoutineHandle for join/abort
+│   ├── spawn.rs     # Spawn implementation using M:N scheduler
 │   └── routine.rs   # Routine lifecycle and state
-├── scheduler/        # M:N scheduler implementation
+├── scheduler/        # M:N scheduler implementation (COMPLETE)
 │   ├── worker.rs    # Worker thread management
 │   ├── queue.rs     # Work-stealing queues
+│   ├── task.rs      # Task abstraction
 │   └── scheduler.rs # Global scheduler coordination
 ├── channel/          # CSP channel implementation
 │   ├── bounded.rs   # Bounded channels
@@ -44,33 +45,45 @@ rust-routines/
 │   ├── mutex.rs     # Routine-aware mutex
 │   ├── waitgroup.rs # WaitGroup implementation
 │   └── once.rs      # Once initialization
+├── io/              # I/O operations
+│   ├── blocking.rs  # Blocking I/O on separate thread pool
+│   ├── file.rs      # File operations
+│   └── net.rs       # Network operations
 └── runtime/         # Runtime management
     ├── runtime.rs   # Runtime initialization
-    ├── executor.rs  # Execution context
+    ├── executor.rs  # Task execution context
+    ├── timer.rs     # Timer wheel for delays
     └── panic.rs     # Panic handling
 ```
 
 ### Design Principles
 
-**1. M:N Threading Model**
+**1. Pure M:N Threading Model**
 - Map M routines to N OS threads
+- NO dependency on external async runtimes (Tokio, async-std)
+- Blocking API with hidden concurrency (Go-style)
 - Automatic load balancing via work-stealing
-- Configurable worker pool size
-- CPU affinity support
 
-**2. Stack Management**
-- Segmented stacks with guard pages
-- Growable stacks (start small, grow on demand)
-- Stack pooling for allocation reuse
-- Platform-specific assembly for context switching
+**2. Dual Thread Pool Design**
+- CPU pool: For compute-bound operations (N threads)
+- I/O pool: For blocking I/O operations (M threads, dynamic)
+- Automatic migration between pools based on operation type
+- Thread pool sizing based on workload characteristics
 
-**3. Channel Design**
+**3. Stack Management**
+- Lightweight routine state (2-4KB per routine)
+- No stack copying (routines are closures/tasks)
+- Efficient memory pooling for routine allocations
+- Automatic cleanup on routine termination
+
+**4. Channel Design**
+- Lock-free channels using crossbeam
 - Type-safe channels with compile-time guarantees
 - Both bounded and unbounded variants
 - Select statement for multiplexing
 - Zero-allocation fast path for common cases
 
-**4. Safety Guarantees**
+**5. Safety Guarantees**
 - No data races (enforced by Rust)
 - Panic isolation per routine
 - Graceful shutdown semantics
@@ -78,72 +91,80 @@ rust-routines/
 
 ## Implementation Phases
 
-### Phase 1: Foundation (v0.1.0)
+### Phase 1: Foundation (v0.1.0) - COMPLETE
 **Goal**: Basic routine spawning and execution
 
-#### Section 1-1: Project Setup
+#### Section 1-1: Project Setup ✓
 - Initialize Cargo project with workspace
 - Configure build system and dependencies
 - Set up CI/CD pipeline
 - Create documentation structure
 
-#### Section 1-2: Basic Routine Implementation
+#### Section 1-2: Basic Routine Implementation ✓
 - Routine struct and lifecycle
 - Simple spawn API: `routine::spawn(|| { ... })`
 - Basic executor with single-threaded runtime
 - Thread-local routine storage
 
-#### Section 1-3: Context Switching
-- Platform-specific assembly (x86_64 first)
-- Stack allocation and management
-- Context save/restore mechanisms
-- Basic yield functionality
+#### Section 1-3: M:N Scheduler ✓
+- Work-stealing scheduler implementation
+- Multiple worker threads
+- Lock-free task queues
+- Basic load balancing
 
-**Deliverables**: Minimal working example with routine spawning
+**Deliverables**: Working M:N scheduler and basic routine spawning
 
-### Phase 2: Scheduler (v0.2.0)
-**Goal**: M:N threading with work-stealing scheduler
+### Phase 2: Scheduler Integration (v0.2.0) - IN PROGRESS
+**Goal**: Connect M:N scheduler to public API and remove Tokio
 
-#### Section 2-1: Worker Thread Pool
-- Worker thread initialization
-- Per-worker run queues
-- Thread parking/unparking
-- Graceful shutdown
+#### Section 2-1: Remove Tokio Dependencies
+- Remove tokio from Cargo.toml
+- Replace tokio::spawn with our scheduler
+- Convert async APIs to blocking APIs
+- Update all tests to remove async/await
 
-#### Section 2-2: Work-Stealing Algorithm
-- Lock-free work-stealing deque
-- Randomized stealing strategy
-- Load balancing heuristics
-- LIFO/FIFO scheduling policies
+#### Section 2-2: I/O Thread Pool
+- Implement separate thread pool for I/O
+- Add routine migration mechanism
+- Detect I/O operations automatically
+- Dynamic thread pool scaling
 
-#### Section 2-3: Scheduler Integration
-- Global scheduler coordination
-- Routine migration between workers
-- CPU affinity and NUMA awareness
-- Performance metrics collection
+#### Section 2-3: Timer Management
+- Implement timer wheel for delays
+- Park/unpark routine support
+- Timeout operations
+- Periodic timer support
 
-**Deliverables**: Multi-threaded runtime with efficient scheduling
+#### Section 2-4: Integration Testing
+- Verify routines use M:N scheduler
+- Test I/O operations don't block CPU pool
+- Benchmark vs Go implementation
+- Stress test with millions of routines
 
-### Phase 3: Channels (v0.3.0)
+**Deliverables**: Fully integrated M:N runtime without Tokio
+
+### Phase 3: Channels (v0.3.0) - PARTIAL
 **Goal**: CSP-style communication primitives
 
-#### Section 3-1: Bounded Channels
+#### Section 3-1: Bounded Channels ✓
 - Ring buffer implementation
 - Send/receive operations
 - Blocking and non-blocking modes
 - Channel closing semantics
 
-#### Section 3-2: Unbounded Channels
+#### Section 3-2: Unbounded Channels ✓
 - Linked list implementation
 - Backpressure mechanisms
 - Memory management
 - Performance optimization
 
-#### Section 3-3: Select Statement
+#### Section 3-3: Select Statement ✓
 - Select macro implementation
 - Non-deterministic choice
 - Default case handling
 - Timeout support
+
+**Note**: Channels work but use Tokio internals - need migration to crossbeam
 
 **Deliverables**: Complete channel system with Go-like semantics
 
@@ -194,19 +215,19 @@ rust-routines/
 **Deliverables**: Production-ready runtime with debugging support
 
 ### Phase 6: Platform Support (v0.6.0)
-**Goal**: Cross-platform compatibility
+**Goal**: Cross-platform compatibility and native I/O
 
-#### Section 6-1: Architecture Support
-- ARM64 context switching
-- RISC-V support
-- WebAssembly adaptation
-- 32-bit platforms
-
-#### Section 6-2: OS-Specific Optimizations
+#### Section 6-1: Native Async I/O
 - Linux io_uring integration
 - Windows IOCP support
 - macOS kqueue integration
 - FreeBSD support
+
+#### Section 6-2: Architecture Support
+- ARM64 support
+- RISC-V support
+- WebAssembly adaptation
+- 32-bit platforms
 
 #### Section 6-3: Embedded Systems
 - no_std support
@@ -216,28 +237,28 @@ rust-routines/
 
 **Deliverables**: Comprehensive platform support
 
-### Phase 7: Ecosystem Integration (v0.7.0)
-**Goal**: Seamless Rust ecosystem integration
+### Phase 7: Ecosystem Compatibility (v0.7.0)
+**Goal**: Optional compatibility layers for async ecosystem
 
-#### Section 7-1: Async/Await Bridge
+#### Section 7-1: Tokio Compatibility Layer
+- Separate crate: rust-routines-tokio
 - Future-to-routine adapter
 - Routine-to-future wrapper
-- Tokio compatibility layer
-- async-std integration
+- Tokio runtime bridge
 
-#### Section 7-2: Standard Library Extensions
+#### Section 7-2: Async-std Compatibility
+- Separate crate: rust-routines-async-std
+- async-std runtime bridge
+- Compatibility shims
+- Migration helpers
+
+#### Section 7-3: Standard Library Extensions
 - routine::io module
 - routine::net for networking
 - routine::fs for filesystem
 - routine::time for timers
 
-#### Section 7-3: Framework Support
-- Web framework integration
-- Database driver support
-- Message queue adapters
-- gRPC compatibility
-
-**Deliverables**: Drop-in replacement for async in many scenarios
+**Deliverables**: Optional compatibility with async ecosystem
 
 ### Phase 8: Performance & Polish (v1.0.0)
 **Goal**: Production-ready 1.0 release
@@ -315,7 +336,7 @@ rust-routines/
 use rust_routines::routine;
 
 fn main() {
-    // Simple routine spawn
+    // Simple routine spawn - NO async/await
     routine::spawn(|| {
         println!("Hello from routine!");
     });
@@ -327,6 +348,7 @@ fn main() {
     });
     
     routine::yield_now(); // Yield to scheduler
+    routine::sleep(Duration::from_secs(1)); // Blocking sleep
 }
 ```
 
@@ -338,11 +360,11 @@ fn main() {
     let (tx, rx) = channel::bounded(10);
     
     routine::spawn(move || {
-        tx.send(42).unwrap();
+        tx.send(42).unwrap(); // Blocking send
     });
     
     routine::spawn(move || {
-        let value = rx.recv().unwrap();
+        let value = rx.recv().unwrap(); // Blocking receive
         println!("Received: {}", value);
     });
 }
@@ -357,6 +379,7 @@ fn main() {
     let (tx2, rx2) = channel::bounded(1);
     
     routine::spawn(move || {
+        // Macro-based select with Go-like syntax
         select! {
             val = rx1.recv() => println!("From rx1: {:?}", val),
             val = rx2.recv() => println!("From rx2: {:?}", val),
@@ -386,16 +409,24 @@ fn main() {
 ## Risk Mitigation
 
 ### Technical Risks
-- **Context Switching Overhead**: Optimize assembly, consider boost.context
-- **Memory Fragmentation**: Implement stack pooling and reuse
-- **Platform Incompatibility**: Graceful fallback to thread-based implementation
-- **Scheduler Bottlenecks**: Multiple run queues, lock-free algorithms
+- **Scheduler Integration**: M:N scheduler exists but not connected to API
+  - **Mitigation**: Follow integration plan in doc/Scheduler-Integration.md
+- **Tokio Removal Complexity**: Channels/select currently use Tokio
+  - **Mitigation**: Migrate to crossbeam channels, implement blocking APIs
+- **I/O Thread Pool Performance**: Blocking I/O might create bottlenecks
+  - **Mitigation**: Dynamic thread pool sizing, eventual native async I/O
+- **Platform Incompatibility**: Some platforms may not support our approach
+  - **Mitigation**: Graceful fallback to simpler threading model
 
 ### Adoption Risks
-- **API Unfamiliarity**: Provide extensive docs and migration guides
-- **Ecosystem Fragmentation**: Ensure compatibility layers
-- **Performance Expectations**: Clear benchmarks and use-case guidance
-- **Debugging Complexity**: Rich debugging and profiling tools
+- **API Changes**: Moving from async/await to blocking API
+  - **Mitigation**: Clear migration guide, optional compatibility layer
+- **Ecosystem Incompatibility**: Won't work directly with async crates
+  - **Mitigation**: Separate compatibility crates for Tokio/async-std
+- **Performance Expectations**: Users expecting async performance
+  - **Mitigation**: Clear benchmarks showing when our model excels
+- **Debugging Complexity**: M:N threading harder to debug than async
+  - **Mitigation**: Rich debugging tools, routine-aware profilers
 
 ## Success Metrics
 
@@ -414,21 +445,25 @@ fn main() {
 ## Dependencies
 
 ### Core Dependencies
-- `libc`: System calls and low-level operations
-- `parking_lot`: Efficient synchronization primitives
-- `crossbeam`: Lock-free data structures
+- `crossbeam`: Lock-free data structures and channels
+- `parking_lot`: Efficient synchronization primitives  
 - `num_cpus`: CPU detection
+- `once_cell`: Lazy statics for global scheduler
+- `rand`: For fair selection in select statements
 
 ### Development Dependencies
 - `criterion`: Benchmarking
 - `proptest`: Property testing
-- `tokio`: Async compatibility testing
 - `tracing`: Debugging and profiling
 
-### Optional Dependencies
-- `jemallocator`: Alternative allocator
-- `mimalloc`: Windows allocator
-- `perf-event`: Linux performance counters
+### Removed Dependencies
+- ~~`tokio`~~: No longer needed - pure M:N implementation
+- ~~`futures`~~: No async/await in core library
+- ~~`async-trait`~~: Blocking APIs throughout
+
+### Optional Dependencies (separate crates)
+- `tokio`: For rust-routines-tokio compatibility crate
+- `async-std`: For rust-routines-async-std compatibility crate
 
 ## Minimum Supported Rust Version (MSRV)
 
