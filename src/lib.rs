@@ -52,7 +52,7 @@ pub mod io;
 pub mod prelude {
     pub use crate::channel::{channel, bounded_channel, unbounded_channel};
     pub use crate::routine::{spawn, spawn_enhanced, spawn_with_name, sleep, yield_now};
-    pub use crate::select::{select, Select, select_recv, select_timeout};
+    pub use crate::select::{select_recv, select_timeout, select_fair, select_blocking, select_try, select_with_timeout};
     pub use crate::error::{Error, Result};
     pub use crate::runtime::{init_global_runtime, RuntimeConfig, with_runtime};
     pub use crate::scheduler::scheduler_stats;
