@@ -55,6 +55,24 @@ impl Task {
     pub fn priority(&self) -> usize {
         self.priority
     }
+    
+    /// Create a dummy task for testing
+    #[cfg(test)]
+    pub fn dummy() -> Self {
+        Self::new(Box::new(|| {}))
+    }
+}
+
+impl Clone for Task {
+    fn clone(&self) -> Self {
+        // For testing purposes - creates a new task with same priority
+        // In production, tasks shouldn't be cloned
+        Self {
+            work: Box::new(|| {}),
+            priority: self.priority,
+            id: self.id,
+        }
+    }
 }
 
 impl Debug for Task {
@@ -71,6 +89,8 @@ pub struct WorkQueue {
     /// The worker side of the deque (for the owning thread)
     worker: DequeWorker<Task>,
     /// The stealer side (for other threads to steal from)
+    /// Currently stored for future self-monitoring features
+    #[allow(dead_code)]
     stealer: Stealer<Task>,
 }
 

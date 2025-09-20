@@ -5,7 +5,7 @@
 use thiserror::Error;
 
 /// Main error type for RustRoutines operations
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 pub enum Error {
     /// Channel send operation failed
     #[error("Failed to send on channel: {reason}")]
@@ -42,6 +42,21 @@ pub enum Error {
     /// Timeout error
     #[error("Operation timed out")]
     Timeout,
+    
+    /// Channel is full
+    #[error("Channel is full")]
+    ChannelFull,
+    
+    /// Channel is empty
+    #[error("Channel is empty")]
+    ChannelEmpty,
+    
+    /// I/O error
+    #[error("I/O error: {reason}")]
+    IOError {
+        /// Reason for the I/O error
+        reason: String
+    },
 }
 
 /// Convenient result type alias

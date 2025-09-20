@@ -22,20 +22,21 @@ RustRoutines is a Rust library that provides Go-style concurrency primitives, in
 │  │ • join()    │  │ • recv()    │  │ • timeout() │  │
 │  └─────────────┘  └─────────────┘  └─────────────┘  │
 ├─────────────────────────────────────────────────────┤
-│                    Runtime                          │
+│              M:N Scheduler Runtime                  │
 │  ┌─────────────────────────────────────────────────┐│
-│  │ • Work-stealing scheduler                       ││
-│  │ • Thread pool management                        ││
+│  │ • Work-stealing scheduler (CPU pool)            ││
+│  │ • I/O thread pool (blocking operations)         ││
+│  │ • Task-to-routine bridge                        ││
 │  │ • Statistics collection                         ││
-│  │ • Tokio integration                             ││
+│  │ • Timer wheel for delays                        ││
 │  └─────────────────────────────────────────────────┘│
 ├─────────────────────────────────────────────────────┤
 │               Foundation Layer                      │
 │  ┌─────────────────────────────────────────────────┐│
-│  │ • Tokio async runtime                           ││
 │  │ • Crossbeam for lock-free data structures       ││
 │  │ • Parking_lot for synchronization               ││
-│  │ • Futures for async abstractions                ││
+│  │ • Standard library for I/O                      ││
+│  │ • Platform-specific APIs (io_uring/IOCP/kqueue) ││
 │  └─────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────┘
 ```
@@ -48,25 +49,27 @@ RustRoutines is a Rust library that provides Go-style concurrency primitives, in
 
 **Key Components**:
 - `RoutineHandle<T>`: Handle to a spawned routine with join/abort capabilities
-- `spawn()`: Creates a new routine from a Future
+- `spawn()`: Creates a new routine on the M:N scheduler
 - `go()`: Alias for spawn with Go-like naming
 - `yield_now()`: Cooperative yielding primitive
-- `sleep()`: Non-blocking sleep function
+- `sleep()`: Blocking sleep that parks the routine
 
 **Implementation Strategy**:
-- Built on top of Tokio tasks for efficient async execution
-- Provides structured concurrency patterns
+- Direct integration with M:N work-stealing scheduler
+- Blocking API with hidden concurrency (Go-style)
 - Handles panics gracefully with proper error propagation
 - Supports cancellation and timeout operations
+- NO async/await - pure blocking semantics
 
 ```rust
-// Example usage
-let handle = go!(async {
-    // Routine work here
-    compute_result().await
+// Example usage - Note: NO async/await
+let handle = go!(|| {
+    // Routine work here - blocking API
+    let result = compute_result();
+    result
 });
 
-let result = handle.join().await?;
+let result = handle.join()?;  // Blocking join
 ```
 
 ### 2. Channel Module (`channel.rs`)
@@ -74,8 +77,8 @@ let result = handle.join().await?;
 **Purpose**: Type-safe message passing between routines.
 
 **Key Components**:
-- `Sender<T>`: Channel sender with async send operations
-- `Receiver<T>`: Channel receiver with async receive operations  
+- `Sender<T>`: Channel sender with blocking send operations
+- `Receiver<T>`: Channel receiver with blocking receive operations  
 - `channel()`: Creates unbuffered channels
 - `bounded_channel()`: Creates channels with specified capacity
 - `unbounded_channel()`: Creates unlimited capacity channels
@@ -86,20 +89,22 @@ let result = handle.join().await?;
 3. **Unbounded Channels**: Asynchronous with unlimited capacity
 
 **Implementation Details**:
-- Built on Tokio's MPSC channels for performance
+- Built on crossbeam channels for lock-free performance
 - Clone-able senders for fan-out patterns
 - Graceful close handling with proper error propagation
 - Support for try_send/try_recv for non-blocking operations
+- Blocking operations that cooperate with M:N scheduler
 
 ```rust
-// Example usage
-let (tx, mut rx) = channel::<Message>();
+// Example usage - Note: NO async/await
+let (tx, rx) = channel::<Message>();
 
-go!(move {
-    tx.send(message).await?;
+go!(move || {
+    tx.send(message)?;  // Blocking send
+    Ok(())
 });
 
-let received = rx.recv().await?;
+let received = rx.recv()?;  // Blocking receive
 ```
 
 ### 3. Select Module (`select.rs`)
@@ -108,7 +113,7 @@ let received = rx.recv().await?;
 
 **Key Components**:
 - `Select<T>`: Builder for select operations
-- `select()`: Creates a new select builder
+- `select!` macro: Go-like select syntax
 - Support for recv, send, default, and timeout cases
 
 **Select Semantics**:
@@ -120,43 +125,78 @@ let received = rx.recv().await?;
 **Implementation Challenges**:
 - Requires careful synchronization to avoid race conditions
 - Must handle partial operations correctly
-- Needs efficient polling mechanism for multiple channels
+- Efficient polling mechanism for multiple channels
 - Fair selection algorithm implementation
+- Integration with M:N scheduler for blocking operations
 
 ```rust
-// Example usage
-let result = select()
-    .recv(rx1, |msg| process_type_a(msg))
-    .recv(rx2, |msg| process_type_b(msg))
-    .timeout(Duration::from_secs(5))
-    .default(|| "no message received".to_string())
-    .run()
-    .await?;
+// Example usage - Note: blocking operations
+select! {
+    msg = rx1.recv() => process_type_a(msg),
+    msg = rx2.recv() => process_type_b(msg),
+    default => println!("no message available"),
+    timeout(Duration::from_secs(5)) => println!("timed out"),
+}
 ```
 
 ### 4. Runtime Module (`runtime.rs`)
 
-**Purpose**: Efficient scheduler and runtime management.
+**Purpose**: M:N scheduler and runtime management.
 
 **Key Components**:
-- `RustRoutineRuntime`: Main runtime struct
+- `RustRoutineRuntime`: Main runtime struct managing the M:N scheduler
 - `RuntimeConfig`: Configuration for runtime behavior
 - `RuntimeStats`: Performance and usage statistics
 - Global runtime management functions
+- CPU worker pool and I/O thread pool separation
 
 **Runtime Features**:
-1. **Work-stealing scheduler**: Efficient load balancing across threads
-2. **Configurable thread pools**: Customizable worker thread count
-3. **Statistics collection**: Monitoring routine lifecycle and performance
-4. **Integration with Tokio**: Leverages existing async ecosystem
+1. **Work-stealing scheduler**: Efficient load balancing across CPU threads
+2. **I/O thread pool**: Separate pool for blocking I/O operations
+3. **Thread migration**: Automatic migration between CPU and I/O pools
+4. **Timer wheel**: Efficient timer management for sleep/timeout operations
+5. **Statistics collection**: Monitoring routine lifecycle and performance
+6. **NUMA-aware scheduling**: On supported platforms
 
 **Performance Considerations**:
-- Minimal overhead for routine spawning
-- Efficient memory usage for large numbers of routines
-- NUMA-aware scheduling on supported platforms
+- Minimal overhead for routine spawning (<1μs)
+- Efficient memory usage for large numbers of routines (2-4KB per routine)
 - Lock-free data structures where possible
+- Thread pool auto-scaling based on workload
 
-### 5. Error Module (`error.rs`)
+### 5. Scheduler Module (`scheduler.rs`)
+
+**Purpose**: Core M:N work-stealing scheduler implementation.
+
+**Key Components**:
+- `Scheduler`: Global scheduler managing worker threads
+- `Worker`: Per-thread worker with local run queue
+- `Task`: Unit of work scheduled on workers
+- Work-stealing deques using crossbeam
+
+**Scheduler Design**:
+1. **Local queues**: Each worker has a local deque for tasks
+2. **Work stealing**: Workers steal from others when local queue empty
+3. **Fair scheduling**: Randomized stealing prevents starvation
+4. **Park/unpark**: Efficient thread sleeping when no work available
+
+### 6. I/O Module (`io.rs`)
+
+**Purpose**: Blocking I/O operations that don't block OS threads.
+
+**Key Components**:
+- `block_on_io()`: Execute blocking I/O on I/O thread pool
+- File operations: read, write, metadata
+- Network operations: TCP, UDP support
+- Future: Native async I/O (io_uring/IOCP/kqueue)
+
+**Implementation Strategy**:
+- Detect I/O operations and migrate routine to I/O pool
+- Use std::fs and std::net for initial implementation
+- Platform-specific optimizations in later phases
+- Automatic thread pool sizing based on I/O load
+
+### 7. Error Module (`error.rs`)
 
 **Purpose**: Comprehensive error handling for all operations.
 
@@ -261,20 +301,23 @@ let result = select()
 
 ## Integration Points
 
-### Tokio Ecosystem
-- Full compatibility with Tokio async/await
-- Integration with Tokio's I/O and timer drivers
-- Compatible with existing Tokio-based libraries
-
 ### Standard Library
-- Implements standard Future trait
-- Compatible with std::sync primitives when needed
+- Full compatibility with std::thread and std::sync
+- Implements standard traits where applicable
 - Follows Rust naming and API conventions
+- Uses std::fs and std::net for I/O operations
+
+### Platform APIs
+- Linux: io_uring for async I/O (future enhancement)
+- Windows: IOCP for completion ports (future enhancement)
+- macOS: kqueue for event notification (future enhancement)
+- Fallback to blocking I/O with thread migration
 
 ### Third-party Crates
 - Crossbeam for lock-free data structures
 - Parking_lot for efficient synchronization
-- Futures for additional async utilities
+- No dependency on async runtimes (Tokio, async-std, etc.)
+- Optional compatibility layers in separate crates
 
 ## Error Handling Strategy
 
@@ -354,36 +397,50 @@ let result = select()
 
 ## Implementation Phases
 
-### Phase 1: Core Foundation (Current)
+### Phase 1: Core Foundation (Current - COMPLETE)
 - [x] Basic routine spawning
 - [x] Simple channels (unbuffered)
 - [x] Basic select functionality
 - [x] Error handling framework
 - [x] Initial runtime implementation
+- [x] M:N work-stealing scheduler
 
-### Phase 2: Enhanced Channels
+### Phase 2: Scheduler Integration (IN PROGRESS)
+- [ ] Connect M:N scheduler to public API
+- [ ] Remove Tokio dependency completely
+- [ ] Implement blocking API for all operations
+- [ ] Add I/O thread pool for blocking operations
+- [ ] Timer wheel for sleep/delay operations
+
+### Phase 3: Enhanced Channels
 - [ ] Buffered channels with proper capacity management
 - [ ] Channel closing semantics
 - [ ] Broadcast channels
 - [ ] Channel iteration patterns
 
-### Phase 3: Advanced Select
+### Phase 4: Advanced Select
 - [ ] Fair selection algorithm
 - [ ] Efficient multi-channel polling
 - [ ] Priority-based selection
 - [ ] Complex timeout handling
 
-### Phase 4: Performance Optimization
+### Phase 5: Performance Optimization
 - [ ] Lock-free channel implementations
 - [ ] Memory pool allocation
 - [ ] NUMA-aware scheduling
 - [ ] Adaptive runtime tuning
 
-### Phase 5: Ecosystem Integration
-- [ ] Tracing and metrics integration
-- [ ] Debug tooling
-- [ ] Performance profiling
-- [ ] Documentation and examples
+### Phase 6: Platform Integration
+- [ ] Linux io_uring support
+- [ ] Windows IOCP support
+- [ ] macOS kqueue support
+- [ ] Embedded system support
+
+### Phase 7: Ecosystem Integration
+- [ ] Optional Tokio compatibility layer (separate crate)
+- [ ] Optional async-std compatibility (separate crate)
+- [ ] Standard library extensions (io, net, fs modules)
+- [ ] Framework adapters
 
 ## Conclusion
 

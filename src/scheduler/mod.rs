@@ -5,10 +5,10 @@
 
 pub mod worker;
 pub mod queue;
-pub mod scheduler;
+pub mod core;
 pub mod steal;
 
-pub use scheduler::{Scheduler, SchedulerConfig};
+pub use core::{Scheduler, SchedulerConfig, GLOBAL_SCHEDULER, scheduler_stats};
 pub use worker::{Worker, WorkerId};
 pub use queue::{WorkQueue, Task};
 pub use steal::{WorkStealer, StealStrategy, SchedulingPolicy, LoadBalancer};

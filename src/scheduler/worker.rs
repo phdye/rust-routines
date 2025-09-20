@@ -3,7 +3,7 @@
 //! Each worker manages a pool of routines and executes them on an OS thread.
 
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -81,7 +81,7 @@ pub struct Worker {
     config: WorkerConfig,
     /// Current state
     state: Arc<AtomicUsize>,
-    /// Local run queue (LIFO for better cache locality)
+    /// Local run queue for compatibility (LIFO for better cache locality)
     local_queue: Arc<ParkingMutex<VecDeque<Task>>>,
     /// Condition variable for parking/unparking
     park_condvar: Arc<Condvar>,
@@ -107,8 +107,17 @@ impl Worker {
         }
     }
     
+    /// Get the stealer for this worker's queue
+    /// Note: This is a placeholder - real stealer will be created in the worker thread
+    pub fn get_stealer(&self) -> super::queue::Stealer<Task> {
+        // We'll return a dummy stealer for now - the real implementation would
+        // need to handle this differently
+        let (_, stealer) = super::queue::WorkQueue::new();
+        stealer
+    }
+    
     /// Start the worker thread
-    pub fn start(&mut self, scheduler: Arc<super::scheduler::Scheduler>) -> Result<()> {
+    pub fn start(&mut self, scheduler: Weak<super::core::Scheduler>) -> Result<()> {
         if self.thread_handle.is_some() {
             return Err(Error::RuntimeError {
                 reason: "Worker already started".to_string(),
@@ -167,7 +176,8 @@ impl Worker {
         Ok(())
     }
     
-    /// Push a task to the worker's local queue
+    /// Push a task to the worker's queue
+    /// Note: Tasks are pushed to the local queue since the work queue is owned by the worker thread
     pub fn push_task(&self, task: Task) {
         let mut queue = self.local_queue.lock();
         queue.push_back(task);
@@ -178,23 +188,7 @@ impl Worker {
             self.unpark();
         }
     }
-    
-    /// Try to steal tasks from this worker's queue
-    pub fn steal_tasks(&self, max_steal: usize) -> Vec<Task> {
-        let mut queue = self.local_queue.lock();
-        let mut stolen = Vec::new();
-        
-        // Steal from the front (FIFO) while worker processes from back (LIFO)
-        let steal_count = (queue.len() / 2).min(max_steal);
-        for _ in 0..steal_count {
-            if let Some(task) = queue.pop_front() {
-                stolen.push(task);
-            }
-        }
-        
-        stolen
-    }
-    
+
     /// Park the worker (put it to sleep)
     pub fn park(&self) {
         self.state.store(WorkerState::Parked as usize, Ordering::Release);
@@ -233,8 +227,10 @@ impl Worker {
             unpark_count: AtomicUsize::new(self.stats.unpark_count.load(Ordering::Relaxed)),
         }
     }
-    
+
     /// Check if the worker has tasks in its queue
+    /// Note: This method is no longer used with the new work queue design
+    /// but kept for compatibility
     pub fn has_tasks(&self) -> bool {
         !self.local_queue.lock().is_empty()
     }
@@ -248,16 +244,25 @@ fn worker_loop(
     park_condvar: Arc<Condvar>,
     stats: Arc<WorkerStats>,
     should_stop: Arc<AtomicBool>,
-    scheduler: Arc<super::scheduler::Scheduler>,
+    scheduler: Weak<super::core::Scheduler>,
 ) {
+    // Create this worker's own work queue
+    let (work_queue, stealer) = super::queue::WorkQueue::new();
+    
+    // Register the stealer with the scheduler
+    if let Some(scheduler_ref) = scheduler.upgrade() {
+        scheduler_ref.register_stealer(config.id, stealer);
+    }
+    
     let mut consecutive_steals = 0;
     
     while !should_stop.load(Ordering::Acquire) {
-        // Try to get a task from the local queue (LIFO for cache locality)
-        let task = {
+        // Try to get a task from the work queue first
+        let task = work_queue.pop().or_else(|| {
+            // Fall back to local queue
             let mut queue = local_queue.lock();
             queue.pop_back()
-        };
+        });
         
         if let Some(task) = task {
             // Execute the task
@@ -265,13 +270,20 @@ fn worker_loop(
             stats.tasks_executed.fetch_add(1, Ordering::Relaxed);
             consecutive_steals = 0;
         } else {
-            // No local work, try to steal from other workers
-            if let Some(stolen_tasks) = scheduler.steal_work(config.id) {
+            // No local work, try to steal from other workers or global queue
+            let stolen_work = if let Some(scheduler) = scheduler.upgrade() {
+                scheduler.steal_work(config.id)
+            } else {
+                // Scheduler has been dropped, exit
+                break;
+            };
+            
+            if let Some(stolen_tasks) = stolen_work {
                 let stolen_count = stolen_tasks.len();
                 if stolen_count > 0 {
-                    let mut queue = local_queue.lock();
+                    // Add stolen tasks to work queue
                     for task in stolen_tasks {
-                        queue.push_back(task);
+                        work_queue.push(task);
                     }
                     stats.tasks_stolen.fetch_add(stolen_count, Ordering::Relaxed);
                     consecutive_steals = 0;
@@ -288,7 +300,7 @@ fn worker_loop(
                 stats.park_count.fetch_add(1, Ordering::Relaxed);
                 
                 let mut queue = local_queue.lock();
-                if queue.is_empty() && !should_stop.load(Ordering::Acquire) {
+                if queue.is_empty() && work_queue.is_empty() && !should_stop.load(Ordering::Acquire) {
                     // Wait for new work or timeout
                     let _timeout = park_condvar.wait_for(
                         &mut queue,
@@ -357,7 +369,7 @@ mod tests {
     fn test_task_queue_operations() {
         let worker = Worker::new(WorkerConfig::default());
         
-        // Push multiple tasks to allow stealing
+        // Push multiple tasks to test the queue
         for _ in 0..4 {
             let task = Task::new(Box::new(|| {
                 // Task logic
@@ -367,9 +379,7 @@ mod tests {
         
         assert!(worker.has_tasks());
         
-        // Steal tasks - should steal half (2 out of 4)
-        let stolen = worker.steal_tasks(10);
-        assert_eq!(stolen.len(), 2);
-        assert!(worker.has_tasks()); // Should still have 2 tasks left
+        // Note: steal_tasks method removed in new design
+        // Stealing now happens through work-stealing deques in worker threads
     }
 }

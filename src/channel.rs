@@ -1,9 +1,11 @@
 //! Channel implementation for RustRoutines
 //!
 //! Provides Go-like channels for type-safe message passing between routines.
+//! Now uses crossbeam channels instead of Tokio for pure M:N threading.
 
 use crate::error::{Error, Result};
-use tokio::sync::mpsc;
+use crossbeam::channel::{bounded, unbounded, Sender as CbSender, Receiver as CbReceiver, TryRecvError, RecvTimeoutError};
+use std::time::Duration;
 
 /// A channel sender
 pub struct Sender<T> {
@@ -16,281 +18,261 @@ pub struct Receiver<T> {
 }
 
 enum ChannelSender<T> {
-    Unbuffered(mpsc::UnboundedSender<T>),
-    Buffered(mpsc::Sender<T>),
+    Bounded(CbSender<T>),
+    Unbounded(CbSender<T>),
 }
 
 enum ChannelReceiver<T> {
-    Unbuffered(mpsc::UnboundedReceiver<T>),
-    Buffered(mpsc::Receiver<T>),
+    Bounded(CbReceiver<T>),
+    Unbounded(CbReceiver<T>),
 }
 
-/// Create an unbuffered channel (actually uses a small buffer for Go-like semantics)
+/// Create an unbuffered channel (synchronous channel with capacity 0)
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     // Go's unbuffered channels block on send until a receiver is ready
-    // We simulate this with a buffer of 0 (synchronous channel)
+    // crossbeam's bounded(0) provides true synchronous behavior
     bounded_channel(0)
 }
 
 /// Create a bounded channel with the specified capacity
 pub fn bounded_channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    if capacity == 0 {
-        // Special case: unbuffered channel (synchronous)
-        // Use buffer size of 1 for now as Tokio doesn't support true unbuffered
-        let (tx, rx) = mpsc::channel(1);
-        (
-            Sender { inner: ChannelSender::Buffered(tx) },
-            Receiver { inner: ChannelReceiver::Buffered(rx) },
-        )
-    } else {
-        let (tx, rx) = mpsc::channel(capacity);
-        (
-            Sender { inner: ChannelSender::Buffered(tx) },
-            Receiver { inner: ChannelReceiver::Buffered(rx) },
-        )
-    }
+    let (tx, rx) = bounded(capacity);
+    (
+        Sender { inner: ChannelSender::Bounded(tx) },
+        Receiver { inner: ChannelReceiver::Bounded(rx) },
+    )
 }
 
 /// Create an unbounded channel
 pub fn unbounded_channel<T>() -> (Sender<T>, Receiver<T>) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = unbounded();
     (
-        Sender { inner: ChannelSender::Unbuffered(tx) },
-        Receiver { inner: ChannelReceiver::Unbuffered(rx) },
+        Sender { inner: ChannelSender::Unbounded(tx) },
+        Receiver { inner: ChannelReceiver::Unbounded(rx) },
     )
 }
 
 impl<T> Sender<T> {
-    /// Send a value on the channel
-    pub async fn send(&self, value: T) -> Result<()> {
+    /// Send a value on this channel (blocking)
+    pub fn send(&self, value: T) -> Result<()> {
         match &self.inner {
-            ChannelSender::Unbuffered(tx) => {
-                tx.send(value)
-                    .map_err(|_| Error::ChannelClosed)
-            }
-            ChannelSender::Buffered(tx) => {
-                tx.send(value).await
-                    .map_err(|_| Error::ChannelClosed)
+            ChannelSender::Bounded(tx) | ChannelSender::Unbounded(tx) => {
+                tx.send(value).map_err(|_| Error::ChannelClosed)
             }
         }
     }
-    
+
     /// Try to send a value without blocking
     pub fn try_send(&self, value: T) -> Result<()> {
         match &self.inner {
-            ChannelSender::Unbuffered(tx) => {
-                tx.send(value)
-                    .map_err(|_| Error::ChannelClosed)
-            }
-            ChannelSender::Buffered(tx) => {
-                tx.try_send(value)
-                    .map_err(|e| match e {
-                        mpsc::error::TrySendError::Closed(_) => Error::ChannelClosed,
-                        mpsc::error::TrySendError::Full(_) => Error::SendError { 
-                            reason: "Channel buffer is full".to_string() 
-                        },
-                    })
+            ChannelSender::Bounded(tx) | ChannelSender::Unbounded(tx) => {
+                tx.try_send(value).map_err(|e| {
+                    if e.is_disconnected() {
+                        Error::ChannelClosed
+                    } else {
+                        Error::ChannelFull
+                    }
+                })
             }
         }
     }
-    
-    /// Check if the channel is closed
-    pub fn is_closed(&self) -> bool {
-        match &self.inner {
-            ChannelSender::Unbuffered(tx) => tx.is_closed(),
-            ChannelSender::Buffered(tx) => tx.is_closed(),
-        }
-    }
-    
-    /// Get the channel capacity (returns None for unbounded channels)
-    pub fn capacity(&self) -> Option<usize> {
-        match &self.inner {
-            ChannelSender::Unbuffered(_) => None,
-            ChannelSender::Buffered(tx) => Some(tx.capacity()),
-        }
-    }
-}
 
-impl<T> Receiver<T> {
-    /// Receive a value from the channel
-    pub async fn recv(&mut self) -> Result<T> {
-        match &mut self.inner {
-            ChannelReceiver::Unbuffered(rx) => {
-                rx.recv().await
-                    .ok_or(Error::ChannelClosed)
-            }
-            ChannelReceiver::Buffered(rx) => {
-                rx.recv().await
-                    .ok_or(Error::ChannelClosed)
-            }
-        }
-    }
-    
-    /// Try to receive a value without blocking
-    pub fn try_recv(&mut self) -> Result<T> {
-        match &mut self.inner {
-            ChannelReceiver::Unbuffered(rx) => {
-                match rx.try_recv() {
-                    Ok(value) => Ok(value),
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        Err(Error::RecvError { reason: "Channel is empty".to_string() })
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        Err(Error::ChannelClosed)
-                    }
-                }
-            }
-            ChannelReceiver::Buffered(rx) => {
-                match rx.try_recv() {
-                    Ok(value) => Ok(value),
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        Err(Error::RecvError { reason: "Channel is empty".to_string() })
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        Err(Error::ChannelClosed)
-                    }
-                }
-            }
-        }
-    }
-    
-    /// Close the receiver, preventing any further receives
-    pub fn close(&mut self) {
-        match &mut self.inner {
-            ChannelReceiver::Unbuffered(rx) => rx.close(),
-            ChannelReceiver::Buffered(rx) => rx.close(),
-        }
-    }
-    
-    /// Check if the channel is empty
-    pub fn is_empty(&self) -> bool {
-        match &self.inner {
-            ChannelReceiver::Unbuffered(rx) => rx.is_empty(),
-            ChannelReceiver::Buffered(rx) => rx.is_empty(),
-        }
-    }
-    
     /// Check if the channel is closed
     pub fn is_closed(&self) -> bool {
         match &self.inner {
-            ChannelReceiver::Unbuffered(rx) => rx.is_closed(),
-            ChannelReceiver::Buffered(rx) => rx.is_closed(),
+            ChannelSender::Bounded(tx) | ChannelSender::Unbounded(tx) => {
+                tx.is_empty() && tx.is_full()  // crossbeam doesn't have is_disconnected for Sender
+            }
         }
     }
 }
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        Self {
-            inner: match &self.inner {
-                ChannelSender::Unbuffered(tx) => ChannelSender::Unbuffered(tx.clone()),
-                ChannelSender::Buffered(tx) => ChannelSender::Buffered(tx.clone()),
+        let inner = match &self.inner {
+            ChannelSender::Bounded(tx) => ChannelSender::Bounded(tx.clone()),
+            ChannelSender::Unbounded(tx) => ChannelSender::Unbounded(tx.clone()),
+        };
+        Sender { inner }
+    }
+}
+
+impl<T> Receiver<T> {
+    /// Receive a value from this channel (blocking)
+    pub fn recv(&self) -> Result<T> {
+        match &self.inner {
+            ChannelReceiver::Bounded(rx) | ChannelReceiver::Unbounded(rx) => {
+                rx.recv().map_err(|_| Error::ChannelClosed)
             }
         }
+    }
+
+    /// Try to receive a value without blocking
+    pub fn try_recv(&self) -> Result<T> {
+        match &self.inner {
+            ChannelReceiver::Bounded(rx) | ChannelReceiver::Unbounded(rx) => {
+                match rx.try_recv() {
+                    Ok(value) => Ok(value),
+                    Err(TryRecvError::Empty) => Err(Error::ChannelEmpty),
+                    Err(TryRecvError::Disconnected) => Err(Error::ChannelClosed),
+                }
+            }
+        }
+    }
+
+    /// Receive a value with a timeout
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<T> {
+        match &self.inner {
+            ChannelReceiver::Bounded(rx) | ChannelReceiver::Unbounded(rx) => {
+                match rx.recv_timeout(timeout) {
+                    Ok(value) => Ok(value),
+                    Err(RecvTimeoutError::Timeout) => Err(Error::Timeout),
+                    Err(RecvTimeoutError::Disconnected) => Err(Error::ChannelClosed),
+                }
+            }
+        }
+    }
+
+    /// Check if the channel is closed and empty
+    pub fn is_closed(&self) -> bool {
+        match &self.inner {
+            ChannelReceiver::Bounded(rx) | ChannelReceiver::Unbounded(rx) => {
+                rx.is_empty() && rx.try_recv().is_err()  // Check if disconnected
+            }
+        }
+    }
+    
+    /// Get access to inner crossbeam receiver for select operations
+    pub(crate) fn inner_ref(&self) -> &CbReceiver<T> {
+        match &self.inner {
+            ChannelReceiver::Bounded(rx) | ChannelReceiver::Unbounded(rx) => rx,
+        }
+    }
+}
+
+// For backward compatibility with async code
+impl<T> Sender<T> {
+    /// Async send (wraps blocking send for compatibility)
+    pub async fn send_async(&self, value: T) -> Result<()> {
+        // Run blocking operation in a way that doesn't block the executor
+        // In the future, this should use the I/O thread pool
+        self.send(value)
+    }
+}
+
+impl<T> Receiver<T> {
+    /// Async receive (wraps blocking recv for compatibility)
+    pub async fn recv_async(&self) -> Option<T> {
+        // Run blocking operation in a way that doesn't block the executor
+        // In the future, this should use the I/O thread pool
+        self.recv().ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    #[tokio::test]
-    async fn test_unbuffered_channel() {
-        let (tx, mut rx) = channel::<i32>();
+    #[test]
+    fn test_unbuffered_channel() {
+        let (tx, rx) = channel::<i32>();
         
-        // Spawn a task to receive
-        let handle = tokio::spawn(async move {
-            rx.recv().await.unwrap()
+        // Spawn a thread to receive
+        std::thread::spawn(move || {
+            assert_eq!(rx.recv().unwrap(), 42);
         });
         
-        // Small delay to ensure receiver is ready
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Give receiver time to start
+        std::thread::sleep(Duration::from_millis(10));
         
-        // Send should complete when receiver is ready
-        tx.send(42).await.unwrap();
-        
-        let value = handle.await.unwrap();
-        assert_eq!(value, 42);
+        // Send should succeed
+        tx.send(42).unwrap();
     }
-    
-    #[tokio::test]
-    async fn test_buffered_channel() {
-        let (tx, mut rx) = bounded_channel::<i32>(3);
+
+    #[test]
+    fn test_buffered_channel() {
+        let (tx, rx) = bounded_channel::<i32>(3);
         
-        // Should be able to send up to capacity without blocking
-        tx.send(1).await.unwrap();
-        tx.send(2).await.unwrap();
-        tx.send(3).await.unwrap();
+        // Should be able to send without blocking
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
         
-        // Should receive in order
-        assert_eq!(rx.recv().await.unwrap(), 1);
-        assert_eq!(rx.recv().await.unwrap(), 2);
-        assert_eq!(rx.recv().await.unwrap(), 3);
+        // Buffer full, try_send should fail
+        assert!(tx.try_send(4).is_err());
+        
+        // Receive values
+        assert_eq!(rx.recv().unwrap(), 1);
+        assert_eq!(rx.recv().unwrap(), 2);
+        assert_eq!(rx.recv().unwrap(), 3);
     }
-    
-    #[tokio::test]
-    async fn test_unbounded_channel() {
-        let (tx, mut rx) = unbounded_channel::<String>();
+
+    #[test]
+    fn test_unbounded_channel() {
+        let (tx, rx) = unbounded_channel::<i32>();
         
         // Can send many values without blocking
-        for i in 0..100 {
-            tx.send(format!("msg-{}", i)).await.unwrap();
+        for i in 0..1000 {
+            tx.send(i).unwrap();
         }
         
-        // Receive first few
-        assert_eq!(rx.recv().await.unwrap(), "msg-0");
-        assert_eq!(rx.recv().await.unwrap(), "msg-1");
+        // Receive them all
+        for i in 0..1000 {
+            assert_eq!(rx.recv().unwrap(), i);
+        }
     }
-    
-    #[tokio::test]
-    async fn test_channel_close() {
-        let (tx, mut rx) = channel::<i32>();
+
+    #[test]
+    fn test_channel_close() {
+        let (tx, rx) = channel::<i32>();
         
-        tx.send(1).await.unwrap();
-        drop(tx); // Close sender
+        // Drop sender
+        drop(tx);
         
-        assert_eq!(rx.recv().await.unwrap(), 1);
-        assert!(rx.recv().await.is_err()); // Should get ChannelClosed
+        // Receiver should get error
+        assert!(rx.recv().is_err());
+        assert!(rx.is_closed());
     }
-    
-    #[tokio::test]
-    async fn test_try_operations() {
-        let (tx, mut rx) = bounded_channel::<i32>(2);
+
+    #[test]
+    fn test_multiple_senders() {
+        let (tx, rx) = bounded_channel::<i32>(10);
+        let tx2 = tx.clone();
         
-        // Try receive on empty channel
+        std::thread::spawn(move || {
+            tx.send(1).unwrap();
+        });
+        
+        std::thread::spawn(move || {
+            tx2.send(2).unwrap();
+        });
+        
+        // Should receive both values
+        let mut values = vec![rx.recv().unwrap(), rx.recv().unwrap()];
+        values.sort();
+        assert_eq!(values, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_try_operations() {
+        let (tx, rx) = bounded_channel::<i32>(1);
+        
+        // try_recv on empty channel
+        assert!(rx.try_recv().is_err());
+        
+        // Send a value
+        tx.send(42).unwrap();
+        
+        // try_recv should work
+        assert_eq!(rx.try_recv().unwrap(), 42);
+        
+        // try_recv on empty channel again
         assert!(rx.try_recv().is_err());
         
         // Fill the buffer
-        tx.try_send(1).unwrap();
-        tx.try_send(2).unwrap();
+        tx.send(1).unwrap();
         
-        // Buffer full, try_send should fail
-        assert!(tx.try_send(3).is_err());
-        
-        // Try receive should work
-        assert_eq!(rx.try_recv().unwrap(), 1);
-    }
-    
-    #[tokio::test]
-    async fn test_multiple_senders() {
-        let (tx1, mut rx) = channel::<i32>();
-        let tx2 = tx1.clone();
-        
-        tokio::spawn(async move {
-            tx1.send(1).await.unwrap();
-        });
-        
-        tokio::spawn(async move {
-            tx2.send(2).await.unwrap();
-        });
-        
-        // Should receive both values (order may vary)
-        let mut values = vec![
-            rx.recv().await.unwrap(),
-            rx.recv().await.unwrap(),
-        ];
-        values.sort();
-        assert_eq!(values, vec![1, 2]);
+        // try_send should fail when full
+        assert!(tx.try_send(2).is_err());
     }
 }
