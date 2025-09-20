@@ -1,8 +1,7 @@
 //! Select macro implementation for RustRoutines
 //!
 //! Provides a Go-like select! macro for multiplexing channel operations.
-//! This macro is designed to work specifically with rust-routines channels
-//! and doesn't require FusedFuture like the futures::select! macro.
+//! This macro works with rust-routines synchronous channels using crossbeam.
 
 /// Select macro for multiplexing channel operations
 /// 
@@ -13,261 +12,41 @@
 /// 
 /// ```no_run
 /// use rust_routines::prelude::*;
-/// use rust_routines::select; // Import the macro explicitly
+/// use rust_routines::rr_select;
 /// use std::time::Duration;
 /// 
-/// # #[tokio::main]
-/// # async fn main() {
-/// let (tx1, mut rx1) = channel::<i32>();
-/// let (_tx2, mut rx2) = channel::<String>();
+/// let (tx1, rx1) = channel::<i32>();
+/// let (tx2, rx2) = channel::<String>();
 /// 
-/// // Send some data for the example to work
-/// tx1.send(42).await.unwrap();
+/// // Send some data
+/// tx1.send(42).unwrap();
 /// 
-/// select! {
-///     val = rx1.recv() => {
+/// rr_select! {
+///     val = rx1 => {
 ///         println!("Received int: {:?}", val);
 ///     },
-///     msg = rx2.recv() => {
+///     msg = rx2 => {
 ///         println!("Received string: {:?}", msg);
+///     },
+///     default => {
+///         println!("No data ready");
 ///     }
 /// }
-/// # }
 /// ```
 #[macro_export]
-macro_rules! select {
-    // Base case with just default
-    (default => $default_body:block) => {{
-        $default_body
-    }};
-    
-    // Single operation with default
-    ($pattern:pat = $expr:expr => $body:block, default => $default_body:block $(,)?) => {{
-        // Try the operation once, fall back to default if not ready
-        use std::task::{Context, Poll};
-        use futures::FutureExt;
-        
-        let mut future = Box::pin($expr);
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        
-        match future.poll_unpin(&mut cx) {
-            Poll::Ready($pattern) => {
-                $body
-            }
-            Poll::Pending => {
-                $default_body
-            }
-        }
-    }};
-    
-    // Single operation without default - just await it
-    ($pattern:pat = $expr:expr => $body:block $(,)?) => {{
-        let $pattern = $expr.await;
-        $body
-    }};
-    
-    // Two operations with default
-    (
-        $pattern1:pat = $expr1:expr => $body1:block,
-        $pattern2:pat = $expr2:expr => $body2:block,
-        default => $default_body:block $(,)?
-    ) => {{
-        use std::task::{Context, Poll};
-        use futures::FutureExt;
-        
-        let mut future1 = Box::pin($expr1);
-        let mut future2 = Box::pin($expr2);
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        
-        // Try first operation
-        match future1.poll_unpin(&mut cx) {
-            Poll::Ready($pattern1) => {
-                $body1
-            }
-            Poll::Pending => {
-                // Try second operation
-                match future2.poll_unpin(&mut cx) {
-                    Poll::Ready($pattern2) => {
-                        $body2
-                    }
-                    Poll::Pending => {
-                        $default_body
-                    }
-                }
-            }
-        }
-    }};
-    
-    // Two operations without default
-    (
-        $pattern1:pat = $expr1:expr => $body1:block,
-        $pattern2:pat = $expr2:expr => $body2:block $(,)?
-    ) => {{
-        // Use tokio::select! for proper async multiplexing
-        tokio::select! {
-            $pattern1 = $expr1 => {
-                $body1
-            }
-            $pattern2 = $expr2 => {
-                $body2
-            }
-        }
-    }};
-}
-
-/// Helper macro to count the number of arms in select!
-#[macro_export]
-#[doc(hidden)]
-macro_rules! count_arms {
-    ($first:expr) => { 1 };
-    ($first:expr, $($rest:expr),+) => { 1 + $crate::count_arms!($($rest),+) };
-}
-
-/// Helper macro to get the index of an arm
-#[macro_export]
-#[doc(hidden)]
-macro_rules! arm_index {
-    ($first:expr, $target:expr) => {
-        0
-    };
-    ($first:expr, $($rest:expr),+, $target:expr) => {
-        1 + $crate::arm_index!($($rest),+, $target)
-    };
-}
-
-/// Alternative select implementation using async/await
-/// This version properly integrates with the async runtime
-#[macro_export]
-macro_rules! select_async {
-    // Pattern: multiple receive branches with optional default and timeout
-    (
-        $($var:ident = $rx:ident.recv() => $body:block),* $(,)?
-        $(, timeout = $timeout_duration:expr => $timeout_body:block)?
-        $(, default => $default_body:block)?
-    ) => {{
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
-        
-        // Create a custom future that polls all branches
-        struct SelectFuture {
-            completed: bool,
-        }
-        
-        impl Future for SelectFuture {
-            type Output = ();
-            
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                if self.completed {
-                    return Poll::Ready(());
-                }
-                
-                // Try polling each receiver
-                $(
-                    {
-                        let mut recv_fut = Box::pin($rx.recv());
-                        match recv_fut.as_mut().poll(cx) {
-                            Poll::Ready(result) => {
-                                self.completed = true;
-                                let $var = result;
-                                $body
-                                return Poll::Ready(());
-                            }
-                            Poll::Pending => {}
-                        }
-                    }
-                )*
-                
-                // Check timeout if specified
-                $(
-                    {
-                        let mut timeout_fut = Box::pin($crate::routine::sleep($timeout_duration));
-                        match timeout_fut.as_mut().poll(cx) {
-                            Poll::Ready(_) => {
-                                self.completed = true;
-                                $timeout_body
-                                return Poll::Ready(());
-                            }
-                            Poll::Pending => {}
-                        }
-                    }
-                )?
-                
-                // If nothing is ready and we have a default case
-                $(
-                    if true {  // Always execute default if we get here
-                        self.completed = true;
-                        $default_body
-                        return Poll::Ready(());
-                    }
-                )?
-                
-                Poll::Pending
-            }
-        }
-        
-        SelectFuture { completed: false }.await
-    }};
-}
-
-/// Simplified select macro for rust-routines
-/// This version uses a simpler polling approach
-#[macro_export]
 macro_rules! rr_select {
-    // Two receivers with optional default
+    // Single receiver without default or timeout - just receive normally
     (
-        $var1:ident = $rx1:expr => $body1:block,
-        $var2:ident = $rx2:expr => $body2:block
-        $(, default => $default_body:block)?
+        $var:ident = $rx:expr => $body:block $(,)?
     ) => {{
-        // Try both receivers in a loop until one succeeds
-        loop {
-            let mut done = false;
-            
-            // Try first receiver
-            match $rx1.try_recv() {
-                Ok($var1) => {
-                    done = true;
-                    $body1
-                    break;
-                }
-                Err(_) => {}
-            }
-            
-            // Try second receiver if first wasn't ready
-            if !done {
-                match $rx2.try_recv() {
-                    Ok($var2) => {
-                        done = true;
-                        $body2
-                        break;
-                    }
-                    Err(_) => {}
-                }
-            }
-            
-            // Execute default if nothing was ready and default is provided
-            $(
-                if !done {
-                    $default_body
-                    break;
-                }
-            )?
-            
-            // If no default case and nothing ready, yield and try again
-            #[allow(unused_assignments)]
-            if !done {
-                $crate::routine::yield_now().await;
-            }
-        }
+        let $var = $rx.recv();
+        $body
     }};
     
     // Single receiver with default
     (
         $var:ident = $rx:expr => $body:block,
-        default => $default_body:block
+        default => $default_body:block $(,)?
     ) => {{
         match $rx.try_recv() {
             Ok($var) => $body,
@@ -278,32 +57,306 @@ macro_rules! rr_select {
     // Single receiver with timeout
     (
         $var:ident = $rx:expr => $body:block,
-        timeout($duration:expr) => $timeout_body:block
+        timeout($duration:expr) => $timeout_body:block $(,)?
     ) => {{
-        // For timeout, we need to use async polling
-        use std::time::Instant;
-        
-        let start = Instant::now();
-        let duration = $duration;
-        
-        // Create a future that resolves to the result
-        async {
-            loop {
-                // Try to receive
-                if let Ok($var) = $rx.try_recv() {
-                    $body
-                    break;
-                }
-                
-                // Check timeout
-                if start.elapsed() >= duration {
-                    $timeout_body
-                    break;
-                }
-                
-                // Small yield to avoid busy waiting
-                $crate::routine::yield_now().await;
-            }
-        }.await
+        match $rx.recv_timeout($duration) {
+            Ok($var) => $body,
+            Err(_) => $timeout_body
+        }
     }};
+    
+    // Two receivers without default - use crossbeam's select
+    (
+        $var1:ident = $rx1:expr => $body1:block,
+        $var2:ident = $rx2:expr => $body2:block $(,)?
+    ) => {{
+        use crossbeam::channel::Select;
+        
+        let mut sel = Select::new();
+        let idx1 = sel.recv($rx1.inner_ref());
+        let idx2 = sel.recv($rx2.inner_ref());
+        
+        let oper = sel.select();
+        let index = oper.index();
+        
+        if index == idx1 {
+            let $var1 = oper.recv($rx1.inner_ref()).unwrap();
+            $body1
+        } else {
+            let $var2 = oper.recv($rx2.inner_ref()).unwrap();
+            $body2
+        }
+    }};
+    
+    // Two receivers with default - try non-blocking first
+    (
+        $var1:ident = $rx1:expr => $body1:block,
+        $var2:ident = $rx2:expr => $body2:block,
+        default => $default_body:block $(,)?
+    ) => {{
+        use crossbeam::channel::Select;
+        
+        // Try non-blocking receives first
+        if let Ok($var1) = $rx1.try_recv() {
+            $body1
+        } else if let Ok($var2) = $rx2.try_recv() {
+            $body2
+        } else {
+            $default_body
+        }
+    }};
+    
+    // Three receivers without default
+    (
+        $var1:ident = $rx1:expr => $body1:block,
+        $var2:ident = $rx2:expr => $body2:block,
+        $var3:ident = $rx3:expr => $body3:block $(,)?
+    ) => {{
+        use crossbeam::channel::Select;
+        
+        let mut sel = Select::new();
+        let idx1 = sel.recv($rx1.inner_ref());
+        let idx2 = sel.recv($rx2.inner_ref());
+        let idx3 = sel.recv($rx3.inner_ref());
+        
+        let oper = sel.select();
+        let index = oper.index();
+        
+        if index == idx1 {
+            let $var1 = oper.recv($rx1.inner_ref()).unwrap();
+            $body1
+        } else if index == idx2 {
+            let $var2 = oper.recv($rx2.inner_ref()).unwrap();
+            $body2
+        } else {
+            let $var3 = oper.recv($rx3.inner_ref()).unwrap();
+            $body3
+        }
+    }};
+    
+    // Three receivers with default
+    (
+        $var1:ident = $rx1:expr => $body1:block,
+        $var2:ident = $rx2:expr => $body2:block,
+        $var3:ident = $rx3:expr => $body3:block,
+        default => $default_body:block $(,)?
+    ) => {{
+        use crossbeam::channel::Select;
+        
+        // Try non-blocking receives first for fairness
+        let mut rng = rand::thread_rng();
+        let mut order = vec![0, 1, 2];
+        use rand::seq::SliceRandom;
+        order.shuffle(&mut rng);
+        
+        let mut handled = false;
+        for &idx in &order {
+            match idx {
+                0 => {
+                    if let Ok($var1) = $rx1.try_recv() {
+                        $body1
+                        handled = true;
+                        break;
+                    }
+                },
+                1 => {
+                    if let Ok($var2) = $rx2.try_recv() {
+                        $body2
+                        handled = true;
+                        break;
+                    }
+                },
+                2 => {
+                    if let Ok($var3) = $rx3.try_recv() {
+                        $body3
+                        handled = true;
+                        break;
+                    }
+                },
+                _ => unreachable!(),
+            }
+        }
+        
+        if !handled {
+            $default_body
+        }
+    }};
+}
+
+/// Simplified select macro with common patterns
+#[macro_export]
+macro_rules! select_timeout {
+    ($timeout:expr, {
+        $($var:ident = $rx:expr => $body:block),+ $(,)?
+    }) => {{
+        use std::time::Instant;
+        use crossbeam::channel::Select;
+        
+        let deadline = Instant::now() + $timeout;
+        let mut result = None;
+        
+        while result.is_none() && Instant::now() < deadline {
+            // Try non-blocking receives
+            $(
+                if let Ok($var) = $rx.try_recv() {
+                    result = Some({ $body });
+                    break;
+                }
+            )+
+            
+            // Small sleep to avoid busy waiting
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        
+        result
+    }};
+}
+
+/// Select macro that returns the value from the selected channel
+#[macro_export]
+macro_rules! select_value {
+    ($($rx:expr),+ $(,)?) => {{
+        use crossbeam::channel::Select;
+        
+        let mut sel = Select::new();
+        let receivers = vec![$($rx),+];
+        let mut indices = Vec::new();
+        
+        for rx in &receivers {
+            indices.push(sel.recv(rx.inner_ref()));
+        }
+        
+        let oper = sel.select();
+        let index = oper.index();
+        
+        // Find which receiver was selected
+        for (i, &idx) in indices.iter().enumerate() {
+            if index == idx {
+                let val = oper.recv(receivers[i].inner_ref()).unwrap();
+                return (i, val);
+            }
+        }
+        
+        unreachable!()
+    }};
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::channel::{channel, bounded_channel};
+    use std::thread;
+    use std::time::Duration;
+    
+    #[test]
+    fn test_rr_select_two_channels() {
+        let (tx1, rx1) = channel::<i32>();
+        let (tx2, rx2) = channel::<i32>();
+        
+        thread::spawn(move || {
+            tx1.send(42).unwrap();
+        });
+        
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            tx2.send(100).unwrap();
+        });
+        
+        thread::sleep(Duration::from_millis(5)); // Let first sender run
+        
+        let mut result = 0;
+        rr_select! {
+            val = rx1 => {
+                result = val;
+            },
+            val = rx2 => {
+                result = val;
+            }
+        }
+        
+        assert_eq!(result, 42);
+    }
+    
+    #[test]
+    fn test_rr_select_default() {
+        let (_tx1, rx1) = channel::<i32>();
+        let (_tx2, rx2) = channel::<String>();
+        
+        let mut result = String::new();
+        
+        rr_select! {
+            _val = rx1 => {
+                result = "Got int".to_string();
+            },
+            _val = rx2 => {
+                result = "Got string".to_string();
+            },
+            default => {
+                result = "Nothing ready".to_string();
+            }
+        }
+        
+        assert_eq!(result, "Nothing ready");
+    }
+    
+    #[test]
+    fn test_rr_select_timeout() {
+        let (_tx, rx) = channel::<i32>();
+        
+        let mut timed_out = false;
+        
+        rr_select! {
+            _val = rx => {
+                timed_out = false;
+            },
+            timeout(Duration::from_millis(10)) => {
+                timed_out = true;
+            }
+        }
+        
+        assert!(timed_out);
+    }
+    
+    #[test]
+    fn test_select_timeout_macro() {
+        let (tx, rx) = channel::<i32>();
+        
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            tx.send(42).unwrap();
+        });
+        
+        let result = select_timeout!(Duration::from_millis(20), {
+            val = rx => { val * 2 }
+        });
+        
+        assert_eq!(result, Some(84));
+    }
+    
+    #[test]
+    fn test_three_channel_select() {
+        let (tx1, rx1) = bounded_channel::<i32>(1);
+        let (tx2, rx2) = bounded_channel::<i32>(1);
+        let (tx3, rx3) = bounded_channel::<i32>(1);
+        
+        tx2.send(200).unwrap();
+        
+        let mut result = 0;
+        
+        rr_select! {
+            val = rx1 => {
+                result = val;
+            },
+            val = rx2 => {
+                result = val;
+            },
+            val = rx3 => {
+                result = val;
+            },
+            default => {
+                result = -1;
+            }
+        }
+        
+        assert_eq!(result, 200);
+    }
 }

@@ -143,31 +143,15 @@ impl<T> Receiver<T> {
     }
     
     /// Get access to inner crossbeam receiver for select operations
-    pub(crate) fn inner_ref(&self) -> &CbReceiver<T> {
+    pub fn inner_ref(&self) -> &CbReceiver<T> {
         match &self.inner {
             ChannelReceiver::Bounded(rx) | ChannelReceiver::Unbounded(rx) => rx,
         }
     }
 }
 
-// For backward compatibility with async code
-impl<T> Sender<T> {
-    /// Async send (wraps blocking send for compatibility)
-    pub async fn send_async(&self, value: T) -> Result<()> {
-        // Run blocking operation in a way that doesn't block the executor
-        // In the future, this should use the I/O thread pool
-        self.send(value)
-    }
-}
-
-impl<T> Receiver<T> {
-    /// Async receive (wraps blocking recv for compatibility)
-    pub async fn recv_async(&self) -> Option<T> {
-        // Run blocking operation in a way that doesn't block the executor
-        // In the future, this should use the I/O thread pool
-        self.recv().ok()
-    }
-}
+// Note: async compatibility methods removed - use blocking operations directly
+// For integration with async code, see rust-routines-tokio compatibility crate (future)
 
 #[cfg(test)]
 mod tests {

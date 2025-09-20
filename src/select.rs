@@ -1,78 +1,21 @@
 //! Select implementation for RustRoutines
 //!
 //! Provides Go-like select functionality for multiplexing channel operations.
-//! Now uses crossbeam's select! macro instead of Tokio for pure M:N threading.
+//! Uses crossbeam's select capabilities for pure M:N threading without async.
 
 use crate::error::{Error, Result};
-use crate::channel::{Receiver, Sender};
+use crate::channel::Receiver;
 use crossbeam::channel::Select as CbSelect;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use rand::seq::SliceRandom;
 use rand::{SeedableRng, rngs::StdRng};
-
-// Note: rr_select macro is defined in select_macro.rs to avoid duplication
-
-/// A select builder for dynamic channel selection
-pub struct Select<'a, T> {
-    operations: Vec<SelectOp<'a, T>>,
-    default_case: Option<Box<dyn FnOnce() -> T + 'a>>,
-    timeout: Option<Duration>,
-}
-
-enum SelectOp<'a, T> {
-    Recv(&'a Receiver<T>, Box<dyn FnOnce(T) -> T + 'a>),
-    Send(&'a Sender<T>, T, Box<dyn FnOnce() -> T + 'a>),
-}
-
-/// Create a new select builder
-pub fn select<T>() -> Select<'static, T> {
-    Select {
-        operations: Vec::new(),
-        default_case: None,
-        timeout: None,
-    }
-}
-
-impl<'a, T: 'a> Select<'a, T> {
-    /// Add a receive operation to the select
-    pub fn recv<U>(mut self, receiver: &'a Receiver<U>, handler: impl FnOnce(U) -> T + 'a) -> Self 
-    where
-        U: 'a,
-        T: From<U>,
-    {
-        // For now, we'll need to handle type conversions differently
-        // This is a simplified version - full implementation would need better type handling
-        self
-    }
-    
-    /// Add a default case that executes if no other operation is ready
-    pub fn default(mut self, handler: impl FnOnce() -> T + 'a) -> Self {
-        self.default_case = Some(Box::new(handler));
-        self
-    }
-    
-    /// Add a timeout to the select operation
-    pub fn timeout(mut self, duration: Duration) -> Self {
-        self.timeout = Some(duration);
-        self
-    }
-    
-    /// Execute the select operation
-    pub fn run(self) -> Result<T> {
-        // For now, return an error - this needs a proper implementation
-        // that doesn't rely on async/await
-        Err(Error::RuntimeError {
-            reason: "Select builder not yet fully implemented without Tokio".to_string()
-        })
-    }
-}
 
 /// Simplified select for two receivers (common case)
 pub fn select_recv<T>(rx1: &Receiver<T>, rx2: &Receiver<T>) -> Result<(usize, T)> {
     // Use crossbeam's Select for fair selection
     let mut sel = CbSelect::new();
     let idx1 = sel.recv(rx1.inner_ref());
-    let idx2 = sel.recv(rx2.inner_ref());
+    let _idx2 = sel.recv(rx2.inner_ref());
     
     let oper = sel.select();
     let selected_index = oper.index();
@@ -111,7 +54,7 @@ pub fn select_fair<T>(receivers: Vec<&Receiver<T>>) -> Result<(usize, T)> {
     let mut indices: Vec<usize> = (0..receivers.len()).collect();
     indices.shuffle(&mut rng);
     
-    // Try each receiver in random order
+    // Try each receiver in random order (non-blocking)
     for &idx in &indices {
         if let Ok(val) = receivers[idx].try_recv() {
             return Ok((idx, val));
@@ -120,24 +63,99 @@ pub fn select_fair<T>(receivers: Vec<&Receiver<T>>) -> Result<(usize, T)> {
     
     // If none ready, block on all using crossbeam's Select
     let mut sel = CbSelect::new();
+    let mut cb_indices = Vec::new();
     for rx in &receivers {
-        sel.recv(rx.inner_ref());
+        cb_indices.push(sel.recv(rx.inner_ref()));
     }
     
     let oper = sel.select();
-    let index = oper.index();
+    let selected = oper.index();
     
-    match receivers[index].recv() {
-        Ok(val) => Ok((index, val)),
-        Err(_) => Err(Error::ChannelClosed),
+    // Find which receiver index was selected and complete the operation
+    for (i, &cb_idx) in cb_indices.iter().enumerate() {
+        if selected == cb_idx {
+            // Must complete the operation through the SelectedOperation
+            match oper.recv(receivers[i].inner_ref()) {
+                Ok(val) => return Ok((i, val)),
+                Err(_) => return Err(Error::ChannelClosed),
+            }
+        }
     }
+    
+    Err(Error::RuntimeError {
+        reason: "Select operation failed".to_string()
+    })
+}
+
+/// Blocking select that waits for any of the channels to have data
+pub fn select_blocking<T>(receivers: &[&Receiver<T>]) -> Result<(usize, T)> {
+    if receivers.is_empty() {
+        return Err(Error::RuntimeError {
+            reason: "No receivers provided".to_string()
+        });
+    }
+    
+    let mut sel = CbSelect::new();
+    let mut indices = Vec::new();
+    
+    for rx in receivers {
+        indices.push(sel.recv(rx.inner_ref()));
+    }
+    
+    // This will block until one channel is ready
+    let oper = sel.select();
+    let selected_index = oper.index();
+    
+    // Find which receiver was selected and complete the operation
+    for (i, &idx) in indices.iter().enumerate() {
+        if selected_index == idx {
+            // Must complete the operation through the SelectedOperation
+            match oper.recv(receivers[i].inner_ref()) {
+                Ok(val) => return Ok((i, val)),
+                Err(_) => return Err(Error::ChannelClosed),
+            }
+        }
+    }
+    
+    Err(Error::RuntimeError {
+        reason: "Select operation failed".to_string()
+    })
+}
+
+/// Non-blocking select that returns immediately
+pub fn select_try<T>(receivers: &[&Receiver<T>]) -> Result<(usize, T)> {
+    for (i, rx) in receivers.iter().enumerate() {
+        if let Ok(val) = rx.try_recv() {
+            return Ok((i, val));
+        }
+    }
+    Err(Error::ChannelEmpty)
+}
+
+/// Select with timeout - waits up to the specified duration
+pub fn select_with_timeout<T>(receivers: &[&Receiver<T>], timeout: Duration) -> Result<(usize, T)> {
+    let deadline = Instant::now() + timeout;
+    
+    // Try non-blocking first
+    if let Ok(result) = select_try(receivers) {
+        return Ok(result);
+    }
+    
+    // Poll with small sleeps until timeout
+    while Instant::now() < deadline {
+        if let Ok(result) = select_try(receivers) {
+            return Ok(result);
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    
+    Err(Error::Timeout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::channel::{bounded_channel, channel};
-    use crate::rr_select;  // Import the macro from select_macro.rs
     use std::thread;
     use std::time::Duration;
 
@@ -192,38 +210,71 @@ mod tests {
         assert!(val >= 1 && val <= 3);
     }
 
-    // Note: rr_select macro tests disabled until macro is fixed for non-async context
-    
-    /*
     #[test]
-    fn test_rr_select_macro() {
+    fn test_select_blocking() {
         let (tx1, rx1) = channel::<i32>();
         let (tx2, rx2) = channel::<i32>();
         
         thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
             tx1.send(42).unwrap();
         });
         
-        thread::spawn(move || {
-            tx2.send(100).unwrap();
-        });
+        let receivers = vec![&rx1, &rx2];
+        let (idx, val) = select_blocking(&receivers).unwrap();
         
-        thread::sleep(Duration::from_millis(10));
-        
-        // Macro needs fixing for sync context
-        
-        assert!(true);
+        assert_eq!(idx, 0);
+        assert_eq!(val, 42);
     }
 
     #[test]
-    fn test_select_default() {
-        let (_tx, rx) = channel::<i32>();
+    fn test_select_try() {
+        let (tx1, rx1) = bounded_channel::<i32>(1);
+        let (_tx2, rx2) = bounded_channel::<i32>(1);
         
-        // Macro needs fixing for sync context
+        // Initially empty
+        let receivers = vec![&rx1, &rx2];
+        assert!(select_try(&receivers).is_err());
         
-        assert!(true);
+        // Send to first channel
+        tx1.send(100).unwrap();
+        
+        let (idx, val) = select_try(&receivers).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(val, 100);
     }
-    */
+
+    #[test]
+    fn test_select_with_timeout() {
+        let (tx, rx1) = channel::<i32>();
+        let (_tx2, rx2) = channel::<i32>();
+        
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            tx.send(42).unwrap();
+        });
+        
+        let receivers = vec![&rx1, &rx2];
+        let (idx, val) = select_with_timeout(&receivers, Duration::from_millis(20)).unwrap();
+        
+        assert_eq!(idx, 0);
+        assert_eq!(val, 42);
+    }
+
+    #[test]
+    fn test_select_with_timeout_expires() {
+        let (_tx1, rx1) = channel::<i32>();
+        let (_tx2, rx2) = channel::<i32>();
+        
+        let receivers = vec![&rx1, &rx2];
+        let result = select_with_timeout(&receivers, Duration::from_millis(10));
+        
+        assert!(result.is_err());
+        match result {
+            Err(Error::Timeout) => (),
+            _ => panic!("Expected timeout error"),
+        }
+    }
 
     #[test]
     fn test_multi_select() {
